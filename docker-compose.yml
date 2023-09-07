@@ -1,0 +1,47 @@
+version: "3.7"
+
+services:
+  go:
+    image: golang:1.21
+    tty: true
+    volumes:
+      - ./:/usr/src/go
+
+  postgres:
+    image: postgres:latest
+    restart: always
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=postgres
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres:/var/lib/postgresql/data
+
+  mysql:
+    image: mariadb:latest
+    cap_add:
+      - SYS_NICE
+    restart: always
+    environment:
+      - MARIADB_USER=mysql
+      - MARIADB_PASSWORD=mysql
+      - MARIADB_DATABASE=mysql
+      - MARIADB_RANDOM_ROOT_PASSWORD=yes
+    ports:
+      - '3306:3306'
+
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    restart: always
+    environment:
+      - ACCEPT_EULA=Y
+      - MSSQL_SA_PASSWORD=your-Strong-Pass-word
+      - MSSQL_PID=Evaluation
+    ports:
+      - '1433:1433'
+
+volumes:
+  postgres: {}
+  mysql: {}
