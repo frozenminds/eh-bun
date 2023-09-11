@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package ehbun
+package bun
 
 import (
 	"context"
@@ -25,11 +25,22 @@ import (
 	"time"
 )
 
-// AggregateEvent - is the event store model that is persisted to the DB
-type AggregateEvent struct {
-	bun.BaseModel `bun:"table:event_store,alias:es"`
+// stream - is a stream of events, contains the events for an aggregate
+type stream struct {
+	bun.BaseModel `bun:"event_stream,alias:s"`
 
-	ID            uuid.UUID              `bun:"id,pk,type:uuid,notnull"`
+	ID            uuid.UUID        `bun:"id,type:uuid,pk"`
+	AggregateType eh.AggregateType `bun:"aggregate_type,notnull"`
+	Position      int64            `bun:"position,type:integer,notnull"`
+	Version       int              `bun:"version,type:integer,notnull"`
+	UpdatedAt     time.Time        `bun:""`
+}
+
+// evt - is the event store model that is persisted to the DB
+type evt struct {
+	bun.BaseModel `bun:"table:event_store,alias:e"`
+
+	Position      int64                  `bun:"position,pk,autoincrement"`
 	AggregateID   uuid.UUID              `bun:"aggregate_id,type:uuid,notnull,unique:idx_aggregateid-version"`
 	Version       int                    `bun:"version,notnull,unique:idx_aggregateid-version"`
 	EventType     eh.EventType           `bun:"event_type,notnull"`
@@ -45,6 +56,7 @@ type AggregateEvent struct {
 type EventStore struct {
 	db                    bun.DB
 	eventHandlerAfterSave eh.EventHandler
+	eventHandlerInTX      eh.EventHandler
 }
 
 // NewEventStore creates a new EventStore with a bun.DB handle.
@@ -59,18 +71,22 @@ func newEventStoreWithHandle(db bun.DB, options ...Option) (*EventStore, error) 
 
 	for _, option := range options {
 		if err := option(eventStore); err != nil {
-			return nil, fmt.Errorf("error while applying option: %v", err)
+			return nil, fmt.Errorf("error while applying option: %w", err)
 		}
 	}
 
 	if err := eventStore.db.DB.Ping(); err != nil {
-		return nil, fmt.Errorf("could not ping to DB: %v", err)
+		return nil, fmt.Errorf("could not ping to DB: %w", err)
 	}
 
+	db.RegisterModel((*stream)(nil))
+	db.RegisterModel((*evt)(nil))
+
 	ctx := context.Background()
+
 	err := eventStore.CreateTables(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("could not create event store table: %v", err)
+		return nil, fmt.Errorf("could not create evt store table: %w", err)
 	}
 
 	return eventStore, nil
@@ -78,6 +94,44 @@ func newEventStoreWithHandle(db bun.DB, options ...Option) (*EventStore, error) 
 
 // Option is an option setter used to configure creation.
 type Option func(*EventStore) error
+
+// WithEventHandler adds an event handler that will be called after saving events.
+// An example would be to add an event bus to publish events.
+func WithEventHandler(h eh.EventHandler) Option {
+	return func(s *EventStore) error {
+		if s.eventHandlerAfterSave != nil {
+			return fmt.Errorf("another event handler is already set")
+		}
+
+		if s.eventHandlerInTX != nil {
+			return fmt.Errorf("another TX event handler is already set")
+		}
+
+		s.eventHandlerAfterSave = h
+
+		return nil
+	}
+}
+
+// WithEventHandlerInTX adds an event handler that will be called during saving of
+// events. An example would be to add an outbox to further process events.
+// For an outbox to be atomic it needs to use the same transaction as the save
+// operation, which is passed down using the context.
+func WithEventHandlerInTX(h eh.EventHandler) Option {
+	return func(s *EventStore) error {
+		if s.eventHandlerAfterSave != nil {
+			return fmt.Errorf("another event handler is already set")
+		}
+
+		if s.eventHandlerInTX != nil {
+			return fmt.Errorf("another TX event handler is already set")
+		}
+
+		s.eventHandlerInTX = h
+
+		return nil
+	}
+}
 
 // Save implements the Save method of the eventhorizon.EventStore interface.
 func (eventStore *EventStore) Save(ctx context.Context, events []eh.Event, originalVersion int) error {
@@ -90,7 +144,7 @@ func (eventStore *EventStore) Save(ctx context.Context, events []eh.Event, origi
 		}
 	}
 
-	aggregateEvents := make([]AggregateEvent, lenEvents)
+	dbEvents := make([]evt, lenEvents)
 	aggregateId := events[0].AggregateID()
 	aggregateType := events[0].AggregateType()
 
@@ -131,23 +185,54 @@ func (eventStore *EventStore) Save(ctx context.Context, events []eh.Event, origi
 			}
 		}
 
-		// Create the AggregateEvent record for the DB.
-		aggregateEvent, err := eventStore.newDBEvent(ctx, event)
+		// Create the evt record for the DB.
+		dbEvent, err := eventStore.newDBEvent(event)
 		if err != nil {
-			return err
+			return &eh.EventStoreError{
+				Err:              fmt.Errorf("could not map to DB event: %w", err),
+				Op:               eh.EventStoreOpSave,
+				AggregateType:    aggregateType,
+				AggregateID:      aggregateId,
+				AggregateVersion: originalVersion,
+				Events:           events,
+			}
 		}
 
-		aggregateEvents[i] = *aggregateEvent
+		dbEvents[i] = *dbEvent
 	}
 
 	if err := eventStore.db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
 
-		_, err := tx.
+		if _, err := tx.
 			NewInsert().
-			Model(&aggregateEvents).
-			Exec(ctx)
+			Model(&dbEvents).
+			Returning("position").
+			Exec(ctx); err != nil {
+			return fmt.Errorf("could not insert events: %w", err)
+		}
 
-		return err
+		// Grab the last event to use for position, returned from the insert above.
+		lastEvent := dbEvents[len(dbEvents)-1]
+
+		// Store the stream, based on the last event for position etc.
+		strm := &stream{
+			ID:            lastEvent.AggregateID,
+			Position:      lastEvent.Position,
+			AggregateType: lastEvent.AggregateType,
+			Version:       lastEvent.Version,
+			UpdatedAt:     lastEvent.Timestamp,
+		}
+		if _, err := tx.NewInsert().
+			Model(strm).
+			On("CONFLICT (id) DO UPDATE").
+			Set("position = EXCLUDED.position").
+			Set("version = EXCLUDED.version").
+			Set("updated_at = EXCLUDED.updated_at").
+			Exec(ctx); err != nil {
+			return fmt.Errorf("could not update stream: %w", err)
+		}
+
+		return nil
 	}); err != nil {
 		return &eh.EventStoreError{
 			Err:              err,
@@ -159,7 +244,7 @@ func (eventStore *EventStore) Save(ctx context.Context, events []eh.Event, origi
 		}
 	}
 
-	// Let the optional AggregateEvent handler handle the events.
+	// Let the optional evt handler handle the events.
 	if eventStore.eventHandlerAfterSave != nil {
 		for _, event := range events {
 			if err := eventStore.eventHandlerAfterSave.HandleEvent(ctx, event); err != nil {
@@ -185,14 +270,14 @@ func (eventStore *EventStore) LoadFrom(ctx context.Context, id uuid.UUID, versio
 
 	rows, err := eventStore.db.
 		NewSelect().
-		Model((*AggregateEvent)(nil)).
+		Model((*evt)(nil)).
 		Where("? = ?", bun.Ident("aggregate_id"), id).
 		Where("? >= ?", bun.Ident("version"), version).
 		Order("version ASC").
 		Rows(ctx)
 
 	if err != nil {
-		return events, &eh.EventStoreError{
+		return nil, &eh.EventStoreError{
 			Err:              err,
 			Op:               eh.EventStoreOpLoad,
 			AggregateID:      id,
@@ -202,10 +287,10 @@ func (eventStore *EventStore) LoadFrom(ctx context.Context, id uuid.UUID, versio
 	defer rows.Close()
 
 	for rows.Next() {
-		aggregateEvent := new(AggregateEvent)
+		aggregateEvent := new(evt)
 		if err := eventStore.db.ScanRow(ctx, rows, aggregateEvent); err != nil {
-			return events, &eh.EventStoreError{
-				Err:              fmt.Errorf("could not scan row: %v", err),
+			return nil, &eh.EventStoreError{
+				Err:              fmt.Errorf("could not scan row: %w", err),
 				Op:               eh.EventStoreOpLoad,
 				AggregateType:    aggregateEvent.AggregateType,
 				AggregateID:      id,
@@ -213,12 +298,12 @@ func (eventStore *EventStore) LoadFrom(ctx context.Context, id uuid.UUID, versio
 			}
 		}
 
-		// Set concrete event data
+		// Set concrete evt data
 		if data, err := eh.CreateEventData(aggregateEvent.EventType); err == nil {
-			// Manually decode the raw event.
+			// Manually decode the raw evt.
 			if err := json.Unmarshal(aggregateEvent.RawData, data); err != nil {
 				return nil, &eh.EventStoreError{
-					Err:              fmt.Errorf("could not unmarshal event data: %v", err),
+					Err:              fmt.Errorf("could not unmarshal evt data: %w", err),
 					Op:               eh.EventStoreOpLoad,
 					AggregateType:    aggregateEvent.AggregateType,
 					AggregateID:      id,
@@ -260,8 +345,8 @@ func (eventStore *EventStore) Close() error {
 	return eventStore.db.Close()
 }
 
-// newDBEvent maps an eventhorizon.Event to an AggregateEvent
-func (eventStore *EventStore) newDBEvent(ctx context.Context, event eh.Event) (*AggregateEvent, error) {
+// newDBEvent maps an eventhorizon.Event to an evt
+func (eventStore *EventStore) newDBEvent(event eh.Event) (*evt, error) {
 
 	raw, err := json.Marshal(event.Data())
 
@@ -275,8 +360,7 @@ func (eventStore *EventStore) newDBEvent(ctx context.Context, event eh.Event) (*
 		}
 	}
 
-	return &AggregateEvent{
-		ID:            uuid.New(),
+	return &evt{
 		AggregateID:   event.AggregateID(),
 		AggregateType: event.AggregateType(),
 		EventType:     event.EventType(),
@@ -288,11 +372,22 @@ func (eventStore *EventStore) newDBEvent(ctx context.Context, event eh.Event) (*
 }
 
 func (eventStore *EventStore) CreateTables(ctx context.Context) error {
-	_, err := eventStore.db.
-		NewCreateTable().
-		Model((*AggregateEvent)(nil)).
-		IfNotExists().
-		Exec(ctx)
 
-	return err
+	if _, err := eventStore.db.
+		NewCreateTable().
+		Model((*stream)(nil)).
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("could not create stream table: %w", err)
+	}
+
+	if _, err := eventStore.db.
+		NewCreateTable().
+		Model((*evt)(nil)).
+		IfNotExists().
+		Exec(ctx); err != nil {
+		return fmt.Errorf("could not create event store table: %w", err)
+	}
+
+	return nil
 }

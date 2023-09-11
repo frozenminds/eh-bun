@@ -1,10 +1,10 @@
-package ehbun_test
+package bun_test
 
 import (
 	"context"
 	"database/sql"
 	"fmt"
-	ehbun "github.com/frozenminds/eh-bun"
+	ehbun "github.com/frozenminds/eh-bun/eventstore/bun"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
@@ -88,16 +88,16 @@ func TestEventStore(t *testing.T) {
 
 	store, err := ehbun.NewEventStore(*db)
 	if err != nil {
-		t.Fatal("could not create a new event store:", err)
+		t.Fatal("could not create a new evt store:", err)
 	}
 	if store == nil {
-		t.Fatal("there should be a event store")
+		t.Fatal("there should be a evt store")
 	}
 
 	eventstore.AcceptanceTest(t, store, context.Background())
 
 	if err := store.Close(); err != nil {
-		t.Error("could not close event store:", err)
+		t.Error("could not close evt store:", err)
 	}
 }
 
@@ -116,10 +116,10 @@ func BenchmarkEventStore(t *testing.B) {
 
 	store, err := ehbun.NewEventStore(*db)
 	if err != nil {
-		t.Fatal("could not create a new event store:", err)
+		t.Fatal("could not create a new evt store:", err)
 	}
 	if store == nil {
-		t.Fatal("there should be a event store")
+		t.Fatal("there should be a evt store")
 	}
 	defer store.Close()
 
