@@ -19,38 +19,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	domain "github.com/frozenminds/eh-bun/domain/event"
 	eh "github.com/looplab/eventhorizon"
 	"github.com/looplab/eventhorizon/uuid"
 	"github.com/uptrace/bun"
-	"time"
 )
-
-// stream - is a stream of events, contains the events for an aggregate
-type stream struct {
-	bun.BaseModel `bun:"event_stream,alias:s"`
-
-	ID            uuid.UUID        `bun:"id,type:uuid,pk"`
-	AggregateType eh.AggregateType `bun:"aggregate_type,notnull"`
-	Position      int64            `bun:"position,type:integer,notnull"`
-	Version       int              `bun:"version,type:integer,notnull"`
-	UpdatedAt     time.Time        `bun:""`
-}
-
-// evt - is the event store model that is persisted to the DB
-type evt struct {
-	bun.BaseModel `bun:"table:event_store,alias:e"`
-
-	Position      int64                  `bun:"position,pk,autoincrement"`
-	AggregateID   uuid.UUID              `bun:"aggregate_id,type:uuid,notnull,unique:idx_aggregateid-version"`
-	Version       int                    `bun:"version,notnull,unique:idx_aggregateid-version"`
-	EventType     eh.EventType           `bun:"event_type,notnull"`
-	RawData       json.RawMessage        `bun:"data"`
-	AggregateType eh.AggregateType       `bun:"aggregate_type,notnull"`
-	Timestamp     time.Time              `bun:"timestamp,notnull"`
-	Metadata      map[string]interface{} `bun:"metadata"`
-	// RawData mapped as eventhorizon.EventData
-	data eh.EventData `bun:"-"`
-}
 
 // EventStore is an eventhorizon.EventStore for Bun
 type EventStore struct {
@@ -79,14 +52,14 @@ func newEventStoreWithHandle(db bun.DB, options ...Option) (*EventStore, error) 
 		return nil, fmt.Errorf("could not ping to DB: %w", err)
 	}
 
-	db.RegisterModel((*stream)(nil))
-	db.RegisterModel((*evt)(nil))
+	db.RegisterModel((*domain.EventStream)(nil))
+	db.RegisterModel((*domain.EventStore)(nil))
 
 	ctx := context.Background()
 
 	err := eventStore.CreateTables(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("could not create evt store table: %w", err)
+		return nil, err
 	}
 
 	return eventStore, nil
@@ -144,7 +117,7 @@ func (eventStore *EventStore) Save(ctx context.Context, events []eh.Event, origi
 		}
 	}
 
-	dbEvents := make([]evt, lenEvents)
+	dbEvents := make([]domain.EventStore, lenEvents)
 	aggregateId := events[0].AggregateID()
 	aggregateType := events[0].AggregateType()
 
@@ -215,7 +188,7 @@ func (eventStore *EventStore) Save(ctx context.Context, events []eh.Event, origi
 		lastEvent := dbEvents[len(dbEvents)-1]
 
 		// Store the stream, based on the last event for position etc.
-		strm := &stream{
+		strm := &domain.EventStream{
 			ID:            lastEvent.AggregateID,
 			Position:      lastEvent.Position,
 			AggregateType: lastEvent.AggregateType,
@@ -270,7 +243,7 @@ func (eventStore *EventStore) LoadFrom(ctx context.Context, id uuid.UUID, versio
 
 	rows, err := eventStore.db.
 		NewSelect().
-		Model((*evt)(nil)).
+		Model((*domain.EventStore)(nil)).
 		Where("? = ?", bun.Ident("aggregate_id"), id).
 		Where("? >= ?", bun.Ident("version"), version).
 		Order("version ASC").
@@ -287,43 +260,43 @@ func (eventStore *EventStore) LoadFrom(ctx context.Context, id uuid.UUID, versio
 	defer rows.Close()
 
 	for rows.Next() {
-		aggregateEvent := new(evt)
-		if err := eventStore.db.ScanRow(ctx, rows, aggregateEvent); err != nil {
+		dbEvent := new(domain.EventStore)
+		if err := eventStore.db.ScanRow(ctx, rows, dbEvent); err != nil {
 			return nil, &eh.EventStoreError{
 				Err:              fmt.Errorf("could not scan row: %w", err),
 				Op:               eh.EventStoreOpLoad,
-				AggregateType:    aggregateEvent.AggregateType,
+				AggregateType:    dbEvent.AggregateType,
 				AggregateID:      id,
 				AggregateVersion: version,
 			}
 		}
 
-		// Set concrete evt data
-		if data, err := eh.CreateEventData(aggregateEvent.EventType); err == nil {
-			// Manually decode the raw evt.
-			if err := json.Unmarshal(aggregateEvent.RawData, data); err != nil {
+		// Set concrete event data
+		if data, err := eh.CreateEventData(dbEvent.EventType); err == nil {
+			// Manually decode the raw data.
+			if err := json.Unmarshal(dbEvent.RawData, data); err != nil {
 				return nil, &eh.EventStoreError{
 					Err:              fmt.Errorf("could not unmarshal evt data: %w", err),
 					Op:               eh.EventStoreOpLoad,
-					AggregateType:    aggregateEvent.AggregateType,
+					AggregateType:    dbEvent.AggregateType,
 					AggregateID:      id,
-					AggregateVersion: aggregateEvent.Version,
+					AggregateVersion: dbEvent.Version,
 					Events:           events,
 				}
 			}
-			aggregateEvent.data = data
+			dbEvent.Data = data
 		}
 
 		event := eh.NewEvent(
-			aggregateEvent.EventType,
-			aggregateEvent.data,
-			aggregateEvent.Timestamp,
+			dbEvent.EventType,
+			dbEvent.Data,
+			dbEvent.Timestamp,
 			eh.ForAggregate(
-				aggregateEvent.AggregateType,
-				aggregateEvent.AggregateID,
-				aggregateEvent.Version,
+				dbEvent.AggregateType,
+				dbEvent.AggregateID,
+				dbEvent.Version,
 			),
-			eh.WithMetadata(aggregateEvent.Metadata),
+			eh.WithMetadata(dbEvent.Metadata),
 		)
 
 		events = append(events, event)
@@ -346,7 +319,7 @@ func (eventStore *EventStore) Close() error {
 }
 
 // newDBEvent maps an eventhorizon.Event to an evt
-func (eventStore *EventStore) newDBEvent(event eh.Event) (*evt, error) {
+func (eventStore *EventStore) newDBEvent(event eh.Event) (*domain.EventStore, error) {
 
 	raw, err := json.Marshal(event.Data())
 
@@ -360,7 +333,7 @@ func (eventStore *EventStore) newDBEvent(event eh.Event) (*evt, error) {
 		}
 	}
 
-	return &evt{
+	return &domain.EventStore{
 		AggregateID:   event.AggregateID(),
 		AggregateType: event.AggregateType(),
 		EventType:     event.EventType(),
@@ -375,7 +348,7 @@ func (eventStore *EventStore) CreateTables(ctx context.Context) error {
 
 	if _, err := eventStore.db.
 		NewCreateTable().
-		Model((*stream)(nil)).
+		Model((*domain.EventStream)(nil)).
 		IfNotExists().
 		Exec(ctx); err != nil {
 		return fmt.Errorf("could not create stream table: %w", err)
@@ -383,7 +356,7 @@ func (eventStore *EventStore) CreateTables(ctx context.Context) error {
 
 	if _, err := eventStore.db.
 		NewCreateTable().
-		Model((*evt)(nil)).
+		Model((*domain.EventStore)(nil)).
 		IfNotExists().
 		Exec(ctx); err != nil {
 		return fmt.Errorf("could not create event store table: %w", err)
