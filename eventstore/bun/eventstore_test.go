@@ -28,7 +28,7 @@ func TestEventStore(t *testing.T) {
 		t.Fatal("could not open db connection")
 	}
 
-	store, err := ehbunes.NewEventStore(*db)
+	store, err := ehbunes.NewEventStore(*db, ehbunes.WithTableReset())
 	if err != nil {
 		t.Fatal("could not create a new evt store:", err)
 	}
@@ -56,12 +56,12 @@ func BenchmarkEventStore(t *testing.B) {
 		t.Fatal("could not open db connection")
 	}
 
-	store, err := ehbunes.NewEventStore(*db)
+	store, err := ehbunes.NewEventStore(*db, ehbunes.WithTableReset())
 	if err != nil {
-		t.Fatal("could not create a new evt store:", err)
+		t.Fatal("could not create a new event store:", err)
 	}
 	if store == nil {
-		t.Fatal("there should be a evt store")
+		t.Fatal("there should be a event store")
 	}
 	defer store.Close()
 

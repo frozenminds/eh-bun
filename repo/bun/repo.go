@@ -31,7 +31,7 @@ type Repo struct {
 	mapDbEntityToEhEntity func(m interface{}) eh.Entity
 	mapEhEntityToDbEntity func(e interface{}) interface{}
 	createTable           bool
-	truncateTable         bool
+	resetTable            bool
 }
 
 // NewRepo creates a new Repo with a bun.DB handle.
@@ -46,7 +46,7 @@ func newRepoWithHandle(db bun.DB, model interface{}, mapDbEntityToEhEntity func(
 		mapDbEntityToEhEntity: mapDbEntityToEhEntity,
 		mapEhEntityToDbEntity: mapEhEntityToDbEntity,
 		createTable:           false,
-		truncateTable:         false,
+		resetTable:            false,
 	}
 
 	for _, option := range options {
@@ -69,8 +69,8 @@ func newRepoWithHandle(db bun.DB, model interface{}, mapDbEntityToEhEntity func(
 			return nil, err
 		}
 	}
-	if r.truncateTable {
-		err := r.doTruncateTable(ctx)
+	if r.resetTable {
+		err := r.doResetTable(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -89,9 +89,9 @@ func WithTableCreate() Option {
 		return nil
 	}
 }
-func WithTableTruncate() Option {
+func WithTableReset() Option {
 	return func(r *Repo) error {
-		r.truncateTable = true
+		r.resetTable = true
 
 		return nil
 	}
@@ -165,6 +165,7 @@ func (r Repo) Save(ctx context.Context, entity eh.Entity) error {
 
 	dbEntity := r.mapEhEntityToDbEntity(entity)
 
+	// MySQL has a slightly different syntax
 	upsert := "CONFLICT (id) DO UPDATE"
 	if r.db.Dialect().Name() == dialect.MySQL {
 		upsert = "DUPLICATE KEY UPDATE"
@@ -240,14 +241,12 @@ func (r Repo) doCreateTable(ctx context.Context) error {
 
 	return nil
 }
-func (r Repo) doTruncateTable(ctx context.Context) error {
+
+func (r Repo) doResetTable(ctx context.Context) error {
 	model := r.model
 
-	if _, err := r.db.
-		NewTruncateTable().
-		Model(model).
-		Exec(ctx); err != nil {
-		return fmt.Errorf("could not truncate model table: %w", err)
+	if err := r.db.ResetModel(ctx, model); err != nil {
+		return fmt.Errorf("could not reset model table: %w", err)
 	}
 
 	return nil

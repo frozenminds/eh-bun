@@ -76,8 +76,7 @@ func TestReadRepoIntegration(t *testing.T) {
 		dbModel,
 		mapDbEntityToEhEntity,
 		mapEhEntityToDbEntity,
-		WithTableCreate(),
-		WithTableTruncate(),
+		WithTableReset(),
 	)
 	if err != nil {
 		t.Fatal("could not create a new repository:", err)
