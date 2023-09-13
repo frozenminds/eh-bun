@@ -39,6 +39,10 @@ store, err := ehbun.NewEventStore(*db)
 
 ### Repo
 
+In order to have a working general repository with BUN, a [model](https://bun.uptrace.dev/guide/golang-orm.html#defining-models) needs to be defined with two mappers, one to map the `eh.Entity` to the BUN model and one the other way around, map the BUN model to the `eh.Entity`.
+
+The two, `eh.Entity` and the BUN model, can be combined into a single `struct`. But just don't use `reflect.DeepEqual` (or similar) in this case.
+
 ```go
 config, err := pgx.ParseConfig("{schema}://{user}:{password}@{hostname}:{port}/{dbname}")
 if err != nil {
@@ -49,8 +53,29 @@ config.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
 sqldb := stdlib.OpenDB(*config)
 
 db = bun.NewDB(sqldb, pgdialect.New())
-repo, err := ehbun.NewRepo(*db)
 
+// BUN model
+dbModel := new(TodoModel)
+mapDbEntityToEhEntity := func(m interface{}) eh.Entity {
+    model := m.(*model)
+    return &mocks.Model{
+        ID:        model.ID,
+        Version:   model.Version,
+        Content:   model.Content,
+        CreatedAt: model.CreatedAt.UTC(),
+    }
+}
+mapEhEntityToDbEntity := func(e interface{}) interface{} {
+    entity := e.(*mocks.Model)
+    return &model{
+        ID:        entity.ID,
+        Version:   entity.Version,
+        Content:   entity.Content,
+        CreatedAt: entity.CreatedAt.UTC(),
+    }
+}
+
+repo, err := ehbun.NewRepo(*db, dbModel, mapDbEntityToEhEntity, mapEhEntityToDbEntity)
 ...
 ```
 
