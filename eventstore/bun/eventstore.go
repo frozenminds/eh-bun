@@ -23,6 +23,7 @@ import (
 	eh "github.com/looplab/eventhorizon"
 	"github.com/looplab/eventhorizon/uuid"
 	"github.com/uptrace/bun"
+	"github.com/uptrace/bun/dialect"
 )
 
 // EventStore is an eventhorizon.EventStore for Bun
@@ -30,6 +31,8 @@ type EventStore struct {
 	db                    bun.DB
 	eventHandlerAfterSave eh.EventHandler
 	eventHandlerInTX      eh.EventHandler
+	createTable           bool
+	resetTable            bool
 }
 
 // NewEventStore creates a new EventStore with a bun.DB handle.
@@ -39,7 +42,9 @@ func NewEventStore(db bun.DB, options ...Option) (*EventStore, error) {
 
 func newEventStoreWithHandle(db bun.DB, options ...Option) (*EventStore, error) {
 	eventStore := &EventStore{
-		db: db,
+		db:          db,
+		createTable: false,
+		resetTable:  false,
 	}
 
 	for _, option := range options {
@@ -57,9 +62,17 @@ func newEventStoreWithHandle(db bun.DB, options ...Option) (*EventStore, error) 
 
 	ctx := context.Background()
 
-	err := eventStore.CreateTables(ctx)
-	if err != nil {
-		return nil, err
+	if eventStore.createTable {
+		err := eventStore.doCreateTable(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if eventStore.resetTable {
+		err := eventStore.doResetTable(ctx)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return eventStore, nil
@@ -68,19 +81,35 @@ func newEventStoreWithHandle(db bun.DB, options ...Option) (*EventStore, error) 
 // Option is an option setter used to configure creation.
 type Option func(*EventStore) error
 
+func WithTableCreate() Option {
+	return func(eventStore *EventStore) error {
+		eventStore.createTable = true
+
+		return nil
+	}
+}
+
+func WithTableReset() Option {
+	return func(eventStore *EventStore) error {
+		eventStore.resetTable = true
+
+		return nil
+	}
+}
+
 // WithEventHandler adds an event handler that will be called after saving events.
 // An example would be to add an event bus to publish events.
-func WithEventHandler(h eh.EventHandler) Option {
-	return func(s *EventStore) error {
-		if s.eventHandlerAfterSave != nil {
+func WithEventHandler(eventHandler eh.EventHandler) Option {
+	return func(eventStore *EventStore) error {
+		if eventStore.eventHandlerAfterSave != nil {
 			return fmt.Errorf("another event handler is already set")
 		}
 
-		if s.eventHandlerInTX != nil {
+		if eventStore.eventHandlerInTX != nil {
 			return fmt.Errorf("another TX event handler is already set")
 		}
 
-		s.eventHandlerAfterSave = h
+		eventStore.eventHandlerAfterSave = eventHandler
 
 		return nil
 	}
@@ -90,17 +119,17 @@ func WithEventHandler(h eh.EventHandler) Option {
 // events. An example would be to add an outbox to further process events.
 // For an outbox to be atomic it needs to use the same transaction as the save
 // operation, which is passed down using the context.
-func WithEventHandlerInTX(h eh.EventHandler) Option {
-	return func(s *EventStore) error {
-		if s.eventHandlerAfterSave != nil {
+func WithEventHandlerInTX(eventHandler eh.EventHandler) Option {
+	return func(eventStore *EventStore) error {
+		if eventStore.eventHandlerAfterSave != nil {
 			return fmt.Errorf("another event handler is already set")
 		}
 
-		if s.eventHandlerInTX != nil {
+		if eventStore.eventHandlerInTX != nil {
 			return fmt.Errorf("another TX event handler is already set")
 		}
 
-		s.eventHandlerInTX = h
+		eventStore.eventHandlerInTX = eventHandler
 
 		return nil
 	}
@@ -195,13 +224,26 @@ func (eventStore *EventStore) Save(ctx context.Context, events []eh.Event, origi
 			Version:       lastEvent.Version,
 			UpdatedAt:     lastEvent.Timestamp,
 		}
-		if _, err := tx.NewInsert().
-			Model(strm).
-			On("CONFLICT (id) DO UPDATE").
-			Set("position = EXCLUDED.position").
-			Set("version = EXCLUDED.version").
-			Set("updated_at = EXCLUDED.updated_at").
-			Exec(ctx); err != nil {
+
+		insertQuery := tx.NewInsert().
+			Model(strm)
+
+		// MySQL has a slightly different syntax
+		if eventStore.db.Dialect().Name() == dialect.MySQL {
+			insertQuery.
+				On("DUPLICATE KEY UPDATE").
+				Set("position = VALUES(position)").
+				Set("version = VALUES(version)").
+				Set("updated_at = VALUES(updated_at)")
+		} else {
+			insertQuery.
+				On("CONFLICT (id) DO UPDATE").
+				Set("position = EXCLUDED.position").
+				Set("version = EXCLUDED.version").
+				Set("updated_at = EXCLUDED.updated_at")
+		}
+
+		if _, err := insertQuery.Exec(ctx); err != nil {
 			return fmt.Errorf("could not update stream: %w", err)
 		}
 
@@ -318,7 +360,7 @@ func (eventStore *EventStore) Close() error {
 	return eventStore.db.Close()
 }
 
-// newDBEvent maps an eventhorizon.Event to an evt
+// newDBEvent maps an eventhorizon.Event to an event
 func (eventStore *EventStore) newDBEvent(event eh.Event) (*domain.EventStore, error) {
 
 	raw, err := json.Marshal(event.Data())
@@ -344,7 +386,7 @@ func (eventStore *EventStore) newDBEvent(event eh.Event) (*domain.EventStore, er
 	}, nil
 }
 
-func (eventStore *EventStore) CreateTables(ctx context.Context) error {
+func (eventStore *EventStore) doCreateTable(ctx context.Context) error {
 
 	if _, err := eventStore.db.
 		NewCreateTable().
@@ -360,6 +402,15 @@ func (eventStore *EventStore) CreateTables(ctx context.Context) error {
 		IfNotExists().
 		Exec(ctx); err != nil {
 		return fmt.Errorf("could not create event store table: %w", err)
+	}
+
+	return nil
+}
+
+func (eventStore *EventStore) doResetTable(ctx context.Context) error {
+	if err := eventStore.db.
+		ResetModel(ctx, (*domain.EventStream)(nil), (*domain.EventStore)(nil)); err != nil {
+		return fmt.Errorf("could not reset model table: %w", err)
 	}
 
 	return nil
