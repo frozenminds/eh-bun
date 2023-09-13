@@ -1,0 +1,17 @@
+name: Update pkg.go.dev cache
+
+on:
+  push:
+    tags:
+      - "v*" # triggers only if push new tag version, like `v0.8.4`
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      GOPROXY: https://proxy.golang.org
+      GO111MODULE: on
+
+    steps:
+      - name: Update pkg.go.dev cache
+        run: go get github.com/${{ github.repository }}@${{ github.ref_name }}
