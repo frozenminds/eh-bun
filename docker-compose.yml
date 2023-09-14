@@ -9,7 +9,6 @@ services:
 
   postgres:
     image: postgres:latest
-    restart: always
     environment:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=postgres
@@ -23,7 +22,6 @@ services:
     image: mariadb:latest
     cap_add:
       - SYS_NICE
-    restart: always
     environment:
       - MARIADB_USER=mysql
       - MARIADB_PASSWORD=mysql
@@ -34,7 +32,6 @@ services:
 
   mssql:
     image: mcr.microsoft.com/mssql/server:2022-latest
-    restart: always
     environment:
       - ACCEPT_EULA=Y
       - MSSQL_SA_PASSWORD=your-Strong-Pass-word
